@@ -1,0 +1,115 @@
+[package]
+name = "cpsnarks-set"
+version = "0.1.0"
+authors = ["Kobi Gurkan <kobigurk@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+accumulator = { git = "https://github.com/kobigurk/cpsnarks-set-accumulator" }
+quick-error = "1.2.3"
+rug = "1.7.0"
+ark-bls12-381 = { version = "0.4", features = ["curve"] }
+merlin = "2.0.0"
+rand = { version = "0.8" }
+ark-ff = "0.4"
+ark-ec = "0.4"
+ark-serialize = "0.4"
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+ark-crypto-primitives = { version = "0.4", features = ["r1cs", "sponge", "prf"] }
+ark-ed-on-bls12-381 = { version = "0.4", features = ["r1cs"] }
+legogroth16 = { version = "0.18", default-features = false }
+ark-snark = "0.4"
+ark-std = "0.4"
+curve25519-dalek = { version = "3", optional = true, features = ["serde", "simd_backend"] }
+bulletproofs = { git = "https://github.com/dalek-cryptography/bulletproofs", branch = "develop", optional = true, features = ["yoloproofs"] }
+digest = "0.8.1"
+blake2 = ">= 0.8.1"
+cfg-if = "0.1"
+gmp-mpfr-sys = { version = "1.4.3", features = ["use-system-libs", "c-no-tests"] }
+ark-groth16 = "0.4"
+
+
+[features]
+dalek = ["curve25519-dalek", "bulletproofs"]
+arkworks = []
+class = []
+default = ["arkworks"]
+
+[dev-dependencies]
+criterion = "0.3"
+
+[lib]
+bench = false
+
+[[bench]]
+name = "root"
+harness = false
+required-features = ["arkworks"]
+
+[[bench]]
+name = "modeq"
+harness = false
+required-features = ["arkworks"]
+
+[[bench]]
+name = "rsa"
+harness = false
+required-features = ["arkworks"]
+
+[[bench]]
+name = "membership_hash"
+harness = false
+required-features = ["arkworks"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+[[bin]]
+name = "setup"
+path = "src/bin/setup.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "prover"
+path = "src/bin/prover.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "verifier"
+path = "src/bin/verifier.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "decrypt"
+path = "src/bin/decrypt.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "auth_setup"
+path = "src/bin/auth_setup.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "auth_prover"
+path = "src/bin/auth_prover.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "auth_verifier"
+path = "src/bin/auth_verifier.rs"
+required-features = ["arkworks"]
+
+[[bin]]
+name = "token_issue"
+path = "src/bin/token_issue.rs"
+required-features = ["arkworks"]

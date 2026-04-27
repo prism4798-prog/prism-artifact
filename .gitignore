@@ -1,0 +1,6 @@
+target/
+zkp-data/
+proof.bin
+*.DS_Store
+*.bin
+!src/**/*.rs
