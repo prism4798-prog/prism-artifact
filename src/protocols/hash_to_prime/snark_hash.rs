@@ -380,8 +380,6 @@ where
         cs: ConstraintSystemRef<E::ScalarField>,
     ) -> Result<(), SynthesisError> {
         // FIRST: Allocate e as the first Witness variable.
-        // Dock's legogroth16 commits to the first commit_witness_count witnesses.
-        // This MUST come before all other allocations.
         let result = FpVar::new_variable(
             ark_relations::ns!(cs, "prime"),
             || self.prime.ok_or(SynthesisError::AssignmentMissing),
@@ -405,9 +403,9 @@ where
             AllocationMode::Witness,
         )?;
 
-        // Poseidon hash: absorb u_x, u_y, j → squeeze one field element
-        // ~250 constraints — compared to ~25,000 for Blake2s
-        // Poseidon hash: absorb u_x, u_y, j → squeeze one field element
+        // ============================================================
+        // Step 1: Poseidon hash-to-prime
+        // ============================================================
         let mut sponge = PoseidonSpongeVar::new(cs.clone(), &self.poseidon_config);
         sponge.absorb(&u_x_var)?;
         sponge.absorb(&u_y_var)?;
@@ -415,46 +413,39 @@ where
         let hash_output = sponge.squeeze_field_elements(1)?;
         let h = hash_output[0].clone();
 
-        // Optimized 1|H construction using field arithmetic.
-        // h.to_bits_be() → take bottom (μ-1) bits → reconstruct r → e = r + 2^(μ-1)
         let h_bits = h.to_bits_be()?;
         let skip = <E::ScalarField as PrimeField>::MODULUS_BIT_SIZE as usize - (self.required_bit_size as usize - 1);
         let bottom_bits: Vec<Boolean<E::ScalarField>> = h_bits[skip..].to_vec();
 
-        // Reconstruct r from bottom (μ-1) bits as field element
         let mut r_var = FpVar::Constant(E::ScalarField::from(0u64));
         let mut bit_power = E::ScalarField::from(1u64);
         for bit in bottom_bits.iter().rev() {
             r_var += FpVar::from(bit.clone()) * FpVar::Constant(bit_power);
-            bit_power += bit_power; // double
+            bit_power += bit_power;
         }
 
-        // e = r + 2^(μ-1) — prepend 1 via field addition
         let leading_one = {
             let mut v = E::ScalarField::from(1u64);
             for _ in 0..(self.required_bit_size - 1) {
-                v += v; // double: 1, 2, 4, 8, ... 2^(μ-1)
+                v += v;
             }
             v
         };
         let e_var = &r_var + &FpVar::Constant(leading_one);
-
-        // Enforce result == e
         result.enforce_equal(&e_var)?;
-        // ============================================================
-        // EC Diffie-Hellman: (x, y) = E_sec · (u_x, u_y)
-        // E_sec is a random scalar, (u_x, u_y) is the JubJub public key.
-        // All native BLS12-381 Fr operations — JubJub coordinates ARE Fr elements.
-        // ============================================================
 
-        // Allocate E_sec as private witness
+        let after_h2p = cs.num_constraints();
+        println!("Step 1 — Hash-to-prime: {} constraints", after_h2p);
+
+        // ============================================================
+        // Step 2: EC Diffie-Hellman
+        // ============================================================
         let e_sec_var = FpVar::new_variable(
             ark_relations::ns!(cs, "e_sec"),
             || self.e_sec.ok_or(SynthesisError::AssignmentMissing),
             AllocationMode::Witness,
         )?;
 
-        // Construct JubJub point from (u_x, u_y) already allocated as FpVars
         let pubkey_var = JubJubVar::new_variable_omit_prime_order_check(
             ark_relations::ns!(cs, "pubkey"),
             || {
@@ -466,22 +457,17 @@ where
             AllocationMode::Witness,
         )?;
 
-        // Enforce the JubJub point uses same u_x, u_y as the Poseidon hash
         pubkey_var.x.enforce_equal(&u_x_var)?;
         pubkey_var.y.enforce_equal(&u_y_var)?;
 
-        // Scalar multiplication: shared_key = E_sec · (u_x, u_y)
-        // Convert E_sec to bits for double-and-add
         let e_sec_bits = e_sec_var.to_bits_le()?;
         let shared_key_var = pubkey_var.scalar_mul_le(e_sec_bits.iter())?;
 
-        // shared_key_var.x and shared_key_var.y are now available
-        // for KDF in the next step: K_pos = Poseidon(salt, x, y, info)
-        // Debug: print constraint count
-                // ============================================================
-        // KDF: K_pos = Poseidon(salt, x, y, info)
-        // salt and info are constants — baked into CRS, 0 extra constraints
-        // x, y come from EC DH shared secret above
+        let after_ecdh = cs.num_constraints();
+        println!("Step 2 — ECDH:          {} constraints (delta: {})", after_ecdh, after_ecdh - after_h2p);
+
+        // ============================================================
+        // Step 3: KDF
         // ============================================================
         let salt_var = FpVar::Constant(self.salt);
         let info_var = FpVar::Constant(self.info);
@@ -494,19 +480,17 @@ where
         let kdf_output = kdf_sponge.squeeze_field_elements(1)?;
         let k_pos = kdf_output[0].clone();
 
-        // k_pos is now available for keystream generation
+        let after_kdf = cs.num_constraints();
+        println!("Step 3 — KDF:           {} constraints (delta: {})", after_kdf, after_kdf - after_ecdh);
 
-                // ============================================================
-        // Byte Packing: m = Σ b_i · 256^i (mod q)
-        // Each byte is a secret witness, constrained to [0, 255]
-        // via 8-bit decomposition. Max 31 bytes (fits in one field element).
+        // ============================================================
+        // Step 4: Byte Packing
         // ============================================================
         let max_bytes = 31;
         let mut m_var = FpVar::Constant(E::ScalarField::from(0u64));
-        let mut power = E::ScalarField::from(1u64);  // native field element for 256^i
+        let mut power = E::ScalarField::from(1u64);
 
         for i in 0..max_bytes {
-            // Allocate 8 bits directly as Boolean witnesses
             let mut byte_bits = Vec::new();
             for j in 0..8u8 {
                 byte_bits.push(Boolean::new_variable(
@@ -524,26 +508,22 @@ where
                 )?);
             }
 
-            // Reconstruct byte from 8 bits: b = Σ bit_j · 2^j
             let mut byte_var = FpVar::Constant(E::ScalarField::from(0u64));
             let mut two_power = E::ScalarField::from(1u64);
             for bit in byte_bits.iter() {
                 byte_var += FpVar::from(bit.clone()) * FpVar::Constant(two_power);
-                two_power += two_power;  // double: 1, 2, 4, 8, ...
+                two_power += two_power;
             }
 
-            // m += byte · 256^i
             m_var += &byte_var * FpVar::Constant(power);
             power *= E::ScalarField::from(256u64);
         }
 
-        // m_var is now the packed field element, k_pos is the session key
-        // Next step: S = Poseidon(salt, K_pos, nc) and C = m + S
+        let after_pack = cs.num_constraints();
+        println!("Step 4 — Byte packing:  {} constraints (delta: {})", after_pack, after_pack - after_kdf);
+
         // ============================================================
-        // Keystream: S = Poseidon(salt, K_pos, nc)
-        // salt is reused constant (domain separation)
-        // K_pos is session key from KDF above
-        // nc is PUBLIC input — verifier sees this nonce
+        // Step 5: Keystream
         // ============================================================
         let nc_var = FpVar::new_variable(
             ark_relations::ns!(cs, "nc"),
@@ -558,20 +538,25 @@ where
         let enc_output = enc_sponge.squeeze_field_elements(1)?;
         let keystream = enc_output[0].clone();
 
+        let after_ks = cs.num_constraints();
+        println!("Step 5 — Keystream:     {} constraints (delta: {})", after_ks, after_ks - after_pack);
+
         // ============================================================
-        // Native Field Encryption: C = m + S (mod q)
-        // C is PUBLIC — verifier sees the ciphertext with the email
+        // Step 6: Encryption
         // ============================================================
         let ciphertext = &m_var + &keystream;
 
-        // C is PUBLIC — verifier sees the ciphertext with the email
         let c_pub = FpVar::new_variable(
             ark_relations::ns!(cs, "ciphertext"),
             || ciphertext.value(),
             AllocationMode::Input,
         )?;
         ciphertext.enforce_equal(&c_pub)?;
-        println!("Total constraints: {}", cs.num_constraints());
+
+        let after_enc = cs.num_constraints();
+        println!("Step 6 — Encryption:    {} constraints (delta: {})", after_enc, after_enc - after_ks);
+        println!("Total constraints:      {}", after_enc);
+
         Ok(())
     }
 }
@@ -1287,7 +1272,7 @@ pub mod test {
         let protocol = Protocol::<Bls12_381, TestParameters>::from_crs(&crs);
 
         let value = Integer::from(12);
-        let (hashed_value, index) = protocol.hash_to_prime(&value).unwrap();
+        let (hashed_value, index) = protocol.hash_to_prime(&value, None).unwrap();
         let c = HashToPrimeHashCircuit::<Bls12_381, TestParameters> {
             security_level: crs.parameters.security_level,
             required_bit_size: crs.parameters.hash_to_prime_bits,
@@ -1323,7 +1308,7 @@ pub mod test {
         let protocol = Protocol::<Bls12_381, TestParameters>::from_crs(&crs);
 
         let value = Integer::from(13);
-        let (hashed_value, _) = protocol.hash_to_prime(&value).unwrap();
+        let (hashed_value, _) = protocol.hash_to_prime(&value, None).unwrap();
         let randomness = Integer::from(9);
         let commitment = protocol
             .crs
@@ -1381,7 +1366,7 @@ pub mod test {
         let protocol = PoseidonProtocol::<Bls12_381>::from_crs(&crs);
 
         let value = Integer::from(13);
-        let (hashed_value, _) = protocol.hash_to_prime(&value).unwrap();
+        let (hashed_value, _) = protocol.hash_to_prime(&value, None).unwrap();
         let randomness = Integer::from(9);
         let commitment = protocol.crs.pedersen_commitment_parameters
             .commit(&hashed_value, &randomness).unwrap();
@@ -1473,7 +1458,7 @@ pub mod test {
         let blake_protocol = Protocol::<Bls12_381, TestParameters>::from_crs(&blake_crs);
 
         let value = Integer::from(13);
-        let (blake_hashed, _) = blake_protocol.hash_to_prime(&value).unwrap();
+        let (blake_hashed, _) = blake_protocol.hash_to_prime(&value, None).unwrap();
         let randomness = Integer::from(9);
         let blake_commitment = blake_protocol.crs.pedersen_commitment_parameters
             .commit(&blake_hashed, &randomness).unwrap();
@@ -1512,7 +1497,7 @@ pub mod test {
         let poseidon_protocol = PoseidonProtocol::<Bls12_381>::from_crs(&poseidon_crs);
 
         let value = Integer::from(13);
-        let (poseidon_hashed, _) = poseidon_protocol.hash_to_prime(&value).unwrap();
+        let (poseidon_hashed, _) = poseidon_protocol.hash_to_prime(&value, None).unwrap();
         let randomness = Integer::from(9);
         let poseidon_commitment = poseidon_protocol.crs.pedersen_commitment_parameters
             .commit(&poseidon_hashed, &randomness).unwrap();
@@ -1581,7 +1566,7 @@ pub mod test {
         let protocol = PoseidonProtocol::<Bls12_381>::from_crs(&crs);
 
         let value = Integer::from(13);
-        let (hashed_value, _) = protocol.hash_to_prime(&value).unwrap();
+        let (hashed_value, _) = protocol.hash_to_prime(&value, None).unwrap();
         let randomness = Integer::from(9);
         let commitment = protocol.crs.pedersen_commitment_parameters
             .commit(&hashed_value, &randomness).unwrap();

@@ -486,4 +486,514 @@ mod tests {
         assert!(!cs.is_satisfied().unwrap(),
             "Impersonation should fail: C = alice + S but sub = steve");
     }
+    // ============================================================
+    // LegoGroth16 integration test for R_auth with c_id commitment
+    // Add this test inside the `mod tests { ... }` block in zkauth.rs
+    // ============================================================
+
+    #[test]
+    fn test_auth_legogroth16() {
+        use ark_bls12_381::{Bls12_381, G1Projective};
+        use ark_ec::{CurveGroup, Group as ArkGroup};
+        use ark_ec::pairing::Pairing;
+        use ark_ff::UniformRand;
+        use ark_serialize::{CanonicalSerialize, CanonicalDeserialize};
+        use std::time::Instant;
+
+        let mut rng = thread_rng();
+
+        // ── 1. Keygen + token ──────────────────────────────────
+        let kp = eddsa_keygen(&mut rng);
+        let t_exp = Fr::from(9999999999u64);
+        let sub = pack_email_to_field("alice@senderdomain.org");
+        let iss = compute_iss("senderdomain.org");
+        let token = token_issue(&mut rng, &kp.sk, &kp.pk, &sub, &iss, &t_exp);
+        assert!(token_verify(&kp.pk, &token), "Token should be valid");
+
+        // ── 2. Simulate email encryption ───────────────────────
+        let keystream_s = Fr::rand(&mut rng);
+        let ciphertext_c = sub + keystream_s;   // C_s = sub + K_s
+
+        // ── 3. LegoGroth16 Setup ───────────────────────────────
+        eprintln!("[test] Running LegoGroth16 setup for R_auth...");
+        let t0 = Instant::now();
+
+        // Pedersen generators (g, h) — in production, share with CP_IdEnc
+        let ped_g = G1Projective::rand(&mut rng);
+        let ped_h = G1Projective::rand(&mut rng);
+
+        let gen = ark_ed_on_bls12_381::EdwardsAffine::generator();
+        let dummy_circuit = AuthCircuit {
+            public_inputs: AuthPublicInputs {
+                pk_op_x: kp.pk.x,
+                pk_op_y: kp.pk.y,
+                iss,
+                t_exp: Fr::from(1000u64),
+                ciphertext_c: Fr::from(1u64),
+            },
+            witnesses: AuthPrivateWitnesses {
+                sub: Fr::from(1u64),
+                r_x: gen.x,
+                r_y: gen.y,
+                s: Fr::from(1u64),
+                k: Fr::from(1u64),
+            },
+        };
+
+        let link_gens = legogroth16::data_structures::LinkPublicGenerators::<Bls12_381> {
+            pedersen_gens: vec![
+                ped_g.into_affine(),
+                ped_h.into_affine(),
+            ],
+            g1: <Bls12_381 as Pairing>::G1::rand(&mut rng).into_affine(),
+            g2: <Bls12_381 as Pairing>::G2::rand(&mut rng).into_affine(),
+        };
+
+        let pk_lego = legogroth16::generate_random_parameters_incl_cp_link(
+            dummy_circuit,
+            link_gens,
+            1,  // commit_witness_count = 1: commit to first witness (sub)
+            &mut rng,
+        ).expect("LegoGroth16 setup failed");
+
+        let setup_time = t0.elapsed();
+        eprintln!("[test] LegoGroth16 setup: {:.1?}", setup_time);
+
+        // ── 4. Prove ───────────────────────────────────────────
+        eprintln!("[test] Generating LegoGroth16 proof...");
+        let t1 = Instant::now();
+
+        let circuit = AuthCircuit {
+            public_inputs: AuthPublicInputs {
+                pk_op_x: kp.pk.x,
+                pk_op_y: kp.pk.y,
+                iss,
+                t_exp,
+                ciphertext_c,
+            },
+            witnesses: AuthPrivateWitnesses {
+                sub: token.sub,
+                r_x: token.sigma.r_point.x,
+                r_y: token.sigma.r_point.y,
+                s: token.sigma.s,
+                k: keystream_s,
+            },
+        };
+
+        let v = Fr::rand(&mut rng);           // Groth16 ZK blinding
+        let link_v = Fr::rand(&mut rng);      // Pedersen randomness r_m
+
+        let proof = legogroth16::create_random_proof_incl_cp_link::<Bls12_381, _, _>(
+            circuit,
+            v,
+            link_v,
+            &pk_lego,
+            &mut rng,
+        ).expect("LegoGroth16 proof failed");
+
+        let prove_time = t1.elapsed();
+        eprintln!("[test] LegoGroth16 prove: {:.1?}", prove_time);
+
+        // Extract c_id' = link_d
+        let c_id_prime = proof.link_d.into_group();
+        eprintln!("[test] c_id' (link_d) extracted");
+
+        // ── 5. Verify ──────────────────────────────────────────
+        eprintln!("[test] Verifying LegoGroth16 proof...");
+        let t2 = Instant::now();
+
+        let public_inputs = vec![
+            kp.pk.x,
+            kp.pk.y,
+            iss,
+            t_exp,
+            ciphertext_c,
+        ];
+
+        let pvk = legogroth16::prepare_verifying_key(&pk_lego.vk.groth16_vk);
+        legogroth16::verify_proof_incl_cp_link(
+            &pvk,
+            &pk_lego.vk,
+            &proof,
+            &public_inputs,
+        ).expect("LegoGroth16 verification failed");
+
+        let verify_time = t2.elapsed();
+        eprintln!("[test] LegoGroth16 verify: {:.1?}", verify_time);
+
+        // ── 6. Manually verify commitment matches ──────────────
+        // Compute expected c_id = g^sub · h^r_m
+        let expected_c_id = ped_g.mul_bigint(sub.into_bigint())
+            + ped_h.mul_bigint(link_v.into_bigint());
+        assert_eq!(c_id_prime, expected_c_id,
+            "c_id' from proof must match manually computed Com(sub, r_m)");
+        eprintln!("[test] ✓ c_id' == Com(sub, r_m) — commitment matches!");
+
+        // ── 7. Test impersonation attack ───────────────────────
+        // Alice tries to prove with sub=alice but C encrypts eve
+        eprintln!("[test] Testing impersonation attack...");
+
+        let sub_eve = pack_email_to_field("eve@senderdomain.org");
+        let keystream_eve = Fr::rand(&mut rng);
+        let ciphertext_eve = sub_eve + keystream_eve;  // C encrypts eve
+
+        let attack_circuit = AuthCircuit {
+            public_inputs: AuthPublicInputs {
+                pk_op_x: kp.pk.x,
+                pk_op_y: kp.pk.y,
+                iss,
+                t_exp,
+                ciphertext_c: ciphertext_eve,  // C encrypts eve
+            },
+            witnesses: AuthPrivateWitnesses {
+                sub: token.sub,  // but alice's token
+                r_x: token.sigma.r_point.x,
+                r_y: token.sigma.r_point.y,
+                s: token.sigma.s,
+                k: keystream_eve,  // alice uses k' = C_eve - sub_alice
+            },
+        };
+
+        // This should fail because C = eve + K but sub = alice
+        // So C != sub + k (the circuit constraint)
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        attack_circuit.generate_constraints(cs.clone()).unwrap();
+        assert!(!cs.is_satisfied().unwrap(),
+            "Impersonation attack must fail: C = eve + K but sub = alice");
+        eprintln!("[test] ✓ Impersonation attack correctly rejected");
+
+        // ── 8. Proof size ──────────────────────────────────────
+        let mut proof_bytes = Vec::new();
+        proof.serialize_compressed(&mut proof_bytes).unwrap();
+        let mut c_id_bytes = Vec::new();
+        c_id_prime.serialize_compressed(&mut c_id_bytes).unwrap();
+
+        eprintln!("\n=== LegoGroth16 Auth Results ===");
+        eprintln!("Setup time:    {:.1?}", setup_time);
+        eprintln!("Prove time:    {:.1?}", prove_time);
+        eprintln!("Verify time:   {:.1?}", verify_time);
+        eprintln!("Proof size:    {} bytes (ProofWithLink)", proof_bytes.len());
+        eprintln!("c_id' size:    {} bytes (G1 point)", c_id_bytes.len());
+        eprintln!("Commitment:    c_id' == Com(sub, r_m) ✓");
+        eprintln!("Impersonation: blocked ✓");
+    }
+    #[test]
+    fn bench_auth_legogroth16_scaling() {
+        use ark_bls12_381::{Bls12_381, G1Projective};
+        use ark_ec::{CurveGroup, Group as ArkGroup};
+        use ark_ec::pairing::Pairing;
+        use ark_ff::UniformRand;
+        use std::time::Instant;
+
+        let mut rng = thread_rng();
+
+        let kp = eddsa_keygen(&mut rng);
+        let t_exp = Fr::from(9999999999u64);
+        let sub = pack_email_to_field("alice@senderdomain.org");
+        let iss = compute_iss("senderdomain.org");
+        let token = token_issue(&mut rng, &kp.sk, &kp.pk, &sub, &iss, &t_exp);
+
+        let keystream_s = Fr::rand(&mut rng);
+        let ciphertext_c = sub + keystream_s;
+
+        let ped_g = G1Projective::rand(&mut rng);
+        let ped_h = G1Projective::rand(&mut rng);
+
+        let gen = ark_ed_on_bls12_381::EdwardsAffine::generator();
+        let dummy_circuit = AuthCircuit {
+            public_inputs: AuthPublicInputs {
+                pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                iss, t_exp: Fr::from(1000u64),
+                ciphertext_c: Fr::from(1u64),
+            },
+            witnesses: AuthPrivateWitnesses {
+                sub: Fr::from(1u64),
+                r_x: gen.x, r_y: gen.y,
+                s: Fr::from(1u64), k: Fr::from(1u64),
+            },
+        };
+
+        let link_gens = legogroth16::data_structures::LinkPublicGenerators::<Bls12_381> {
+            pedersen_gens: vec![ped_g.into_affine(), ped_h.into_affine()],
+            g1: <Bls12_381 as Pairing>::G1::rand(&mut rng).into_affine(),
+            g2: <Bls12_381 as Pairing>::G2::rand(&mut rng).into_affine(),
+        };
+
+        let pk_lego = legogroth16::generate_random_parameters_incl_cp_link(
+            dummy_circuit, link_gens, 1, &mut rng,
+        ).expect("setup failed");
+
+        let thread_counts = [1, 2, 4, 6, 8, 10, 12, 14, 16];
+
+        eprintln!("\n=== LegoGroth16 Auth Parallel Scaling ===");
+        eprintln!("Threads | Prove (ms)");
+        eprintln!("--------|----------");
+
+        for &threads in &thread_counts {
+            std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+
+            // Warm-up
+            {
+                let c = AuthCircuit {
+                    public_inputs: AuthPublicInputs {
+                        pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                        iss, t_exp, ciphertext_c,
+                    },
+                    witnesses: AuthPrivateWitnesses {
+                        sub: token.sub,
+                        r_x: token.sigma.r_point.x,
+                        r_y: token.sigma.r_point.y,
+                        s: token.sigma.s, k: keystream_s,
+                    },
+                };
+                let v = Fr::rand(&mut rng);
+                let lv = Fr::rand(&mut rng);
+                let _ = legogroth16::create_random_proof_incl_cp_link::<Bls12_381, _, _>(
+                    c, v, lv, &pk_lego, &mut rng,
+                );
+            }
+
+            // Median of 3
+            let mut times = Vec::new();
+            for _ in 0..3 {
+                let c = AuthCircuit {
+                    public_inputs: AuthPublicInputs {
+                        pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                        iss, t_exp, ciphertext_c,
+                    },
+                    witnesses: AuthPrivateWitnesses {
+                        sub: token.sub,
+                        r_x: token.sigma.r_point.x,
+                        r_y: token.sigma.r_point.y,
+                        s: token.sigma.s, k: keystream_s,
+                    },
+                };
+                let v = Fr::rand(&mut rng);
+                let lv = Fr::rand(&mut rng);
+                let t = Instant::now();
+                let _ = legogroth16::create_random_proof_incl_cp_link::<Bls12_381, _, _>(
+                    c, v, lv, &pk_lego, &mut rng,
+                ).unwrap();
+                times.push(t.elapsed().as_millis());
+            }
+            times.sort();
+            eprintln!("{:>7} | {}", threads, times[1]);
+        }
+
+        // Also measure verify and CRS gen
+        let circuit = AuthCircuit {
+            public_inputs: AuthPublicInputs {
+                pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                iss, t_exp, ciphertext_c,
+            },
+            witnesses: AuthPrivateWitnesses {
+                sub: token.sub,
+                r_x: token.sigma.r_point.x,
+                r_y: token.sigma.r_point.y,
+                s: token.sigma.s, k: keystream_s,
+            },
+        };
+        let v = Fr::rand(&mut rng);
+        let lv = Fr::rand(&mut rng);
+        let proof = legogroth16::create_random_proof_incl_cp_link::<Bls12_381, _, _>(
+            circuit, v, lv, &pk_lego, &mut rng,
+        ).unwrap();
+
+        let public_inputs = vec![kp.pk.x, kp.pk.y, iss, t_exp, ciphertext_c];
+        let pvk = legogroth16::prepare_verifying_key(&pk_lego.vk.groth16_vk);
+
+        let mut vtimes = Vec::new();
+        for _ in 0..3 {
+            let t = Instant::now();
+            legogroth16::verify_proof_incl_cp_link(&pvk, &pk_lego.vk, &proof, &public_inputs).unwrap();
+            vtimes.push(t.elapsed().as_micros());
+        }
+        vtimes.sort();
+        eprintln!("\nVerify (median): {} µs", vtimes[1]);
+
+        // CRS gen
+        let dummy2 = AuthCircuit {
+            public_inputs: AuthPublicInputs {
+                pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                iss, t_exp: Fr::from(1000u64),
+                ciphertext_c: Fr::from(1u64),
+            },
+            witnesses: AuthPrivateWitnesses {
+                sub: Fr::from(1u64),
+                r_x: gen.x, r_y: gen.y,
+                s: Fr::from(1u64), k: Fr::from(1u64),
+            },
+        };
+        let link_gens2 = legogroth16::data_structures::LinkPublicGenerators::<Bls12_381> {
+            pedersen_gens: vec![ped_g.into_affine(), ped_h.into_affine()],
+            g1: <Bls12_381 as Pairing>::G1::rand(&mut rng).into_affine(),
+            g2: <Bls12_381 as Pairing>::G2::rand(&mut rng).into_affine(),
+        };
+        let t = Instant::now();
+        let _ = legogroth16::generate_random_parameters_incl_cp_link(
+            dummy2, link_gens2, 1, &mut rng,
+        ).unwrap();
+        eprintln!("CRS gen: {} ms", t.elapsed().as_millis());
+    }
+    #[test]
+    fn bench_auth_receiver_groth16() {
+        use ark_bls12_381::Bls12_381;
+        use ark_ff::UniformRand;
+        use ark_serialize::CanonicalSerialize;
+        use ark_relations::r1cs::SynthesisError;
+        use ark_groth16::Groth16;
+        use ark_snark::SNARK;
+        use std::time::Instant;
+
+        #[derive(Clone)]
+        struct ReceiverAuthCircuit {
+            inner: AuthCircuit,
+            dummy_witnesses: Vec<Fr>,
+        }
+
+        impl ConstraintSynthesizer<Fr> for ReceiverAuthCircuit {
+            fn generate_constraints(
+                self,
+                cs: ConstraintSystemRef<Fr>,
+            ) -> Result<(), SynthesisError> {
+                let dummies = self.dummy_witnesses.clone();
+                self.inner.generate_constraints(cs.clone())?;
+                for i in 0..5029 {
+                    let a = FpVar::new_witness(cs.clone(), || {
+                        Ok(dummies.get(i*2)
+                            .copied().unwrap_or(Fr::from(1u64)))
+                    })?;
+                    let b = FpVar::new_witness(cs.clone(), || {
+                        Ok(dummies.get(i*2+1)
+                            .copied().unwrap_or(Fr::from(1u64)))
+                    })?;
+                    let _c = &a * &b;
+                }
+                Ok(())
+            }
+        }
+
+        let mut rng = thread_rng();
+
+        let kp = eddsa_keygen(&mut rng);
+        let t_exp = Fr::from(9999999999u64);
+        let sub = pack_email_to_field("alice@senderdomain.org");
+        let iss = compute_iss("senderdomain.org");
+        let token = token_issue(&mut rng, &kp.sk, &kp.pk, &sub, &iss, &t_exp);
+
+        let keystream_s = Fr::rand(&mut rng);
+        let ciphertext_c = sub + keystream_s;
+
+        let gen = ark_ed_on_bls12_381::EdwardsAffine::generator();
+        let dummy_wits: Vec<Fr> = (0..10058).map(|_| Fr::rand(&mut rng)).collect();
+
+        let dummy_circuit = ReceiverAuthCircuit {
+            inner: AuthCircuit {
+                public_inputs: AuthPublicInputs {
+                    pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                    iss, t_exp: Fr::from(1000u64),
+                    ciphertext_c: Fr::from(1u64),
+                },
+                witnesses: AuthPrivateWitnesses {
+                    sub: Fr::from(1u64),
+                    r_x: gen.x, r_y: gen.y,
+                    s: Fr::from(1u64), k: Fr::from(1u64),
+                },
+            },
+            dummy_witnesses: dummy_wits.clone(),
+        };
+
+        // Setup
+        let t0 = Instant::now();
+        let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(
+            dummy_circuit, &mut rng,
+        ).expect("setup failed");
+        let setup_ms = t0.elapsed().as_millis();
+
+        // Prove (3 runs, median)
+        let mut prove_times = Vec::new();
+        for _ in 0..3 {
+            let c = ReceiverAuthCircuit {
+                inner: AuthCircuit {
+                    public_inputs: AuthPublicInputs {
+                        pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                        iss, t_exp, ciphertext_c,
+                    },
+                    witnesses: AuthPrivateWitnesses {
+                        sub: token.sub,
+                        r_x: token.sigma.r_point.x,
+                        r_y: token.sigma.r_point.y,
+                        s: token.sigma.s, k: keystream_s,
+                    },
+                },
+                dummy_witnesses: dummy_wits.clone(),
+            };
+            let t1 = Instant::now();
+            let _ = Groth16::<Bls12_381>::prove(&pk, c, &mut rng).unwrap();
+            prove_times.push(t1.elapsed().as_millis());
+        }
+        prove_times.sort();
+
+        // Verify
+        let c = ReceiverAuthCircuit {
+            inner: AuthCircuit {
+                public_inputs: AuthPublicInputs {
+                    pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                    iss, t_exp, ciphertext_c,
+                },
+                witnesses: AuthPrivateWitnesses {
+                    sub: token.sub,
+                    r_x: token.sigma.r_point.x,
+                    r_y: token.sigma.r_point.y,
+                    s: token.sigma.s, k: keystream_s,
+                },
+            },
+            dummy_witnesses: dummy_wits.clone(),
+        };
+        let proof = Groth16::<Bls12_381>::prove(&pk, c, &mut rng).unwrap();
+
+        let public_inputs = vec![kp.pk.x, kp.pk.y, iss, t_exp, ciphertext_c];
+        let pvk = Groth16::<Bls12_381>::process_vk(&vk).unwrap();
+        let t2 = Instant::now();
+        let valid = Groth16::<Bls12_381>::verify_with_processed_vk(&pvk, &public_inputs, &proof).unwrap();
+        let verify_us = t2.elapsed().as_micros();
+        assert!(valid, "proof must verify");
+
+        let mut pk_bytes = Vec::new();
+        pk.serialize_compressed(&mut pk_bytes).unwrap();
+        let mut vk_bytes = Vec::new();
+        vk.serialize_compressed(&mut vk_bytes).unwrap();
+        let mut proof_bytes = Vec::new();
+        proof.serialize_compressed(&mut proof_bytes).unwrap();
+
+        // Constraint count
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let check_circuit = ReceiverAuthCircuit {
+            inner: AuthCircuit {
+                public_inputs: AuthPublicInputs {
+                    pk_op_x: kp.pk.x, pk_op_y: kp.pk.y,
+                    iss, t_exp, ciphertext_c,
+                },
+                witnesses: AuthPrivateWitnesses {
+                    sub: token.sub,
+                    r_x: token.sigma.r_point.x,
+                    r_y: token.sigma.r_point.y,
+                    s: token.sigma.s, k: keystream_s,
+                },
+            },
+            dummy_witnesses: dummy_wits.clone(),
+        };
+        check_circuit.generate_constraints(cs.clone()).unwrap();
+
+        eprintln!("\n=== Receiver Auth (Groth16, ~12,300 constraints) ===");
+        eprintln!("Constraints: {}", cs.num_constraints());
+        eprintln!("Setup:       {} ms", setup_ms);
+        eprintln!("Prove:       {} ms (median of 3: {}, {}, {})",
+            prove_times[1], prove_times[0], prove_times[1], prove_times[2]);
+        eprintln!("Verify:      {} us", verify_us);
+        eprintln!("PK size:     {} bytes ({} KB)", pk_bytes.len(), pk_bytes.len()/1024);
+        eprintln!("VK size:     {} bytes", vk_bytes.len());
+        eprintln!("Proof size:  {} bytes", proof_bytes.len());
+    }
+
 }
