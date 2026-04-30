@@ -1,4 +1,4 @@
-# PRISM: Privacy-Preserving Routing with Identity-Shielded Mail
+# PRISM: 
 
 **Artifact for CCS 2026 submission** 
 
