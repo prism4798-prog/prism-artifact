@@ -1,6 +1,6 @@
 # PRISM: A Deployable Architecture for Identity-Hiding Email on Standard SMTP, S/MIME, and LDAP
 
-**Artifact for CCS 2026 submission** 
+**Artifact for CCS 2026 submission Cycle B** 
 
 ## Overview
 
