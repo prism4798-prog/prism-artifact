@@ -1,6 +1,6 @@
 # PRISM: Privacy-Preserving Routing with Identity-Shielded Mail
 
-**Artifact for CCS 2026 submission** cycle b hello
+**Artifact for CCS 2026 submission** 
 
 ## Overview
 
