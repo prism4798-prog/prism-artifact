@@ -1,4 +1,4 @@
-# PRISM: A Deployable Architecture for Identity-Hiding Email on Standard SMTP, S/MIME, and LDAP
+# VEIL: A Deployable Architecture for Identity-Hiding Email on Standard SMTP, S/MIME, and LDAP
 
 ## Overview
 
