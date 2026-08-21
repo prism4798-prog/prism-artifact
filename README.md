@@ -2,7 +2,7 @@
 
 ## Overview
 
-PRISM hides both sender and recipient email identities from mail transfer agents using zero-knowledge proofs. The system runs on standard email infrastructure (Postfix + Dovecot + Nodemailer) with no SMTP modifications.
+VEIL hides both sender and recipient email identities from mail transfer agents using zero-knowledge proofs. The system runs on standard email infrastructure (Postfix + Dovecot + Nodemailer) with no SMTP modifications.
 
 The system implements two algorithms:
 - **Algorithm 1 (Identity-Hiding Header Protocol):** CP-SNARK set membership proof combining CPRoot + CPmodEq + CP_IdEnc (6,456 R1CS constraints)
