@@ -551,10 +551,6 @@ The paper describes two authentication circuits, both built on top of the `AuthC
 
 **Implementation:** The `bench_auth_legogroth16` test in `zkauth.rs` benchmarks the sender auth circuit using LegoGroth16 with `commit_witness_count = 1` to commit only `sub` as the designated witness, producing a Pedersen commitment `c_id' = Com(sub, r_m)` alongside the proof.
 
-**LegoGroth16 crate note:** The `legogroth16` crate's `generate_random_parameters_incl_cp_link` accepts a `commit_witness_count` parameter. Setting it to `1` commits only the first witness variable (`sub`) rather than all witnesses jointly. This is critical for the identity binding design: the sender MTA checks `c_id' == c_id` (from CP_IdEnc), and Pedersen binding guarantees the same `sub` appears in both proofs.
-
-The original `auth_prover` binary uses plain Groth16 (192 B proof) because it was written before the identity binding design was finalized. The `bench_auth_legogroth16` test reflects the paper's LegoGroth16 design and produces the numbers reported in §8.2.
-
 ```bash
 # Reproduces: 7,266 constraints, 230ms setup, 170ms prove, 7ms verify
 cargo test --release --features arkworks bench_auth_legogroth16 -- --nocapture
@@ -726,6 +722,8 @@ Added `pub mod serialization;`
 3. **Proof and key sizes are from real serialization** — `CanonicalSerialize` on actual arkworks/legogroth16 data structures.
 4. **Verification times are from real pairing checks** — `verify_proof` / `verify_proof_incl_cp_link` on actual proofs.
 5. **SMTP relay timing (186 ms) is measured from Postfix logs** — the relay path is unchanged by ZK auth.
+6. **Common-mailbox scalability (Table 7)** — measured by populating the common mailbox with varying numbers of test emails and timing the `decrypt` binary's trial decryption scan on a t2.micro instance.
+7. **Client hardware benchmarks (Table 6)** — measured by running the same `bench_auth_legogroth16`, `bench_auth_receiver_groth16`, and `prover` benchmarks on t3.medium (2 vCPUs), t3.xlarge (4 vCPUs), c5.2xlarge (8 vCPUs), and c5.9xlarge (36 vCPUs).
 
 ## Reproducing Benchmarks
 
@@ -819,7 +817,7 @@ sudo su - bob -c "/usr/local/bin/decrypt --key /home/bob/bob_key.bin \
 | Receiver auth prove (Groth16) | 291 ms | 192 B |
 | Receiver auth verify | 3 ms | VK: 632 B |
 | Token issuance | 0.38 ms | 216 B |
-| ECDH decrypt | 34 ms | — |
+| ECDH decrypt | 27 ms | — |
 | SMTP relay | 186 ms | — |
 | **End-to-end (steady state)** | **~902 ms** | — |
 | **MTA overhead only** | **53 ms** | — |
